@@ -1,162 +1,153 @@
-# MVP сервиса повторяющихся списаний трудозатрат в Redmine
+# MVP: локальный сервис повторяющихся списаний трудозатрат в Redmine
+
+## Что меняется относительно предыдущей версии
+
+- Приложение **не публикуется наружу** (не нужен публичный деплой).
+- Нужна только **удобная локальная настройка заданий**.
+- Автоматический запуск делаем через **локальный `crontab`**, а не через встроенный scheduler-сервис в docker-compose.
+
+---
 
 ## 1) Два стека реализации
 
-### Стек A (рекомендованный): Python + FastAPI + APScheduler + SQLAlchemy + PostgreSQL
+### Стек A (рекомендованный): Python + FastAPI (локально) + SQLite + crontab
 
 **Состав:**
-- **Frontend**: Jinja/HTMX или React (минимум можно начать с server-rendered HTML)
-- **Backend API**: FastAPI
-- **Scheduler/Worker**: APScheduler (в отдельном процессе)
-- **DB**: PostgreSQL
-- **Queue (опционально)**: без отдельной очереди на MVP
+- **UI/API**: FastAPI + простые HTML-шаблоны (или HTMX)
+- **Хранение**: SQLite (один локальный пользователь)
+- **Запуск по расписанию**: системный `crontab` (каждую минуту вызывает runner)
+- **Интеграция**: Redmine REST API
 
 **Плюсы:**
-- Быстрый старт и минимальная сложность для MVP.
-- APScheduler легко работает с cron и timezone.
-- FastAPI даёт удобную валидацию (Pydantic) и OpenAPI.
-- В Python удобно писать ретраи, интеграции и cron-логику.
+- Минимум инфраструктуры, очень быстро собрать.
+- Удобно конфигурировать задания через локальный веб-интерфейс.
+- Не нужен отдельный worker/broker.
 
 **Минусы:**
-- Для высоких нагрузок/сложных пайплайнов потребуется переход на очередь (Celery/RQ).
-- Нужно аккуратно организовать single-instance scheduler (не запускать дублирующие инстансы).
+- Не рассчитано на многопользовательскую нагрузку.
+- Для сложных очередей/распределённого запуска потребуется миграция на более тяжёлый стек.
 
 ---
 
-### Стек B: Node.js + NestJS/Express + BullMQ + Redis + PostgreSQL
+### Стек B: Node.js + Express + SQLite/PostgreSQL + node-cron + crontab-trigger
 
 **Состав:**
-- **Frontend**: React/Vue (или server-side шаблоны)
-- **Backend API**: NestJS (или Express)
-- **Scheduler/Worker**: BullMQ repeatable jobs
-- **DB**: PostgreSQL
-- **Queue**: Redis + BullMQ
+- **UI/API**: Express + EJS/React
+- **Хранение**: SQLite (локально) или PostgreSQL
+- **Запуск**: `crontab` вызывает Node-скрипт `run-due-jobs`
 
 **Плюсы:**
-- Хорошая модель фоновых задач (очереди, retries, delayed jobs из коробки).
-- Удобно масштабировать workers горизонтально.
-- Единый стек TypeScript для frontend/backend.
+- TS/JS-экосистема, удобно если команда уже на Node.
+- Просто расширять API.
 
 **Минусы:**
-- Выше инфраструктурная сложность (нужен Redis).
-- Для маленького сервиса избыточно по компонентам.
+- Для MVP чуть больше шаблонного кода, чем в FastAPI.
 
 ---
 
-## 2) Выбор для MVP
+## 2) Рекомендация для текущего сценария
 
-Для MVP на 1–3 дня оптимален **Стек A**:
-- меньше инфраструктуры (без Redis/Celery),
-- достаточно надёжности для задач “несколько повторов в день/неделю”,
-- проще деплой через `docker-compose`.
+Так как запуск локальный и без публикации, лучший вариант — **Стек A (Python + FastAPI + SQLite + crontab)**.
 
-## 3) Архитектура и взаимодействие компонентов
+Почему SQLite:
+- локальный single-user сценарий;
+- нулевой overhead на администрирование БД;
+- достаточно надёжно для cron-runner с транзакциями и уникальными индексами.
+
+Если позже появится multi-user/серверный режим — перейти на PostgreSQL.
+
+---
+
+## 3) Архитектура (локальный режим)
 
 Компоненты:
-1. **Web UI + API (FastAPI)**
+1. **Локальный UI/API (FastAPI)**
    - CRUD расписаний
    - ручной запуск
    - просмотр логов
-   - простая авторизация (single-user password)
-2. **Scheduler (APScheduler, отдельный процесс)**
-   - читает активные расписания
-   - вычисляет локальное время Europe/Riga
-   - запускает job execution
-3. **Execution service**
-   - валидация issue в Redmine
-   - дедупликация
-   - создание time entry
-   - retry с backoff
-   - запись результата в таблицу запусков
-4. **PostgreSQL**
-   - хранение расписаний, секретов, логов, дедуп-ключей
-5. **Redmine REST API**
+   - хранение Redmine API key (шифрованно)
+2. **Cron runner (CLI-скрипт)**
+   - запускается `crontab` каждую минуту
+   - выбирает due-задания
+   - выполняет создание time entry
+   - пишет результат в лог-таблицу
+3. **SQLite БД**
+   - расписания, логи, dedupe lock, секреты
+4. **Redmine API**
    - `GET /issues/{id}.json`
    - `POST /time_entries.json`
-   - (опц.) `GET /time_entries.json` для дедуп-проверки
+   - (опц.) `GET /time_entries.json` для дедупа
 
-Поток выполнения:
-1. Пользователь создаёт расписание через UI.
-2. API сохраняет расписание, проверяет issue и (опционально) activity.
-3. Scheduler по cron поднимает задачу.
-4. Execution service проверяет дедуп-условие.
-5. Если дубля нет — создаёт time entry в Redmine.
-6. Пишет `job_runs` (success/error, payload, response, error text).
+### Поток
+1. Пользователь на `http://127.0.0.1:8000` создаёт/меняет расписание.
+2. `crontab` каждую минуту вызывает `python -m app.run_due_jobs`.
+3. Runner берёт активные задания и проверяет: “должно ли выполниться сейчас в Europe/Riga?”.
+4. Делает дедуп-проверку.
+5. Создаёт time entry в Redmine.
+6. Сохраняет лог выполнения.
 
-## 4) Схема БД (PostgreSQL)
+---
 
-### Таблица `users`
+## 4) Схема БД
+
+### `app_settings`
 - `id` (PK)
-- `username` (unique)
-- `password_hash`
-- `created_at`
-
-### Таблица `redmine_connections`
-- `id` (PK)
-- `user_id` (FK -> users)
-- `redmine_base_url`
-- `api_key_encrypted` (AES-GCM ciphertext)
-- `api_key_iv`
-- `api_key_tag`
+- `redmine_base_url` (text)
+- `api_key_encrypted` (blob/text)
 - `created_at`
 - `updated_at`
 
-### Таблица `schedules`
+### `schedules`
 - `id` (PK)
-- `user_id` (FK)
 - `name` (text)
 - `enabled` (bool)
 - `timezone` (text, default `Europe/Riga`)
-- `cron_expr` (text, nullable)
-- `days_of_week` (int[] или text, nullable) — для упрощённого UI
-- `run_time_local` (time, nullable) — для упрощённого UI
+- `cron_expr` (text, nullable) — если пользователь ввёл cron
+- `days_of_week` (text, nullable) — например `1,2,3,4,5`
+- `run_time_local` (text, nullable, `HH:MM`) — для упрощённого UI
 - `issue_id` (int)
-- `project_id` (int, nullable)
-- `hours` (numeric(4,2))
-- `rounding_step` (numeric(3,2), default 0.25)
+- `hours` (real/decimal)
+- `rounding_step` (real, default `0.25`)
 - `activity_id` (int, nullable)
-- `activity_name` (text, nullable)
 - `comments` (text)
-- `dedupe_mode` (text: `remote`, `local`, `hybrid`)
 - `skip_weekends` (bool default false)
 - `charge_user_id` (int, nullable)
-- `last_run_at` (timestamptz, nullable)
+- `dedupe_mode` (text: `local`/`hybrid`)
+- `last_run_at` (datetime, nullable)
 - `last_status` (text, nullable)
 - `created_at`
 - `updated_at`
 
-### Таблица `job_runs`
-- `id` (PK)
-- `schedule_id` (FK -> schedules)
-- `trigger_type` (text: `cron`/`manual`)
-- `run_at` (timestamptz)
-- `local_entry_date` (date) — дата списания в Europe/Riga
-- `status` (text: `success`/`error`/`skipped_duplicate`/`skipped_weekend`)
-- `attempt` (int)
-- `request_payload` (jsonb)
-- `response_payload` (jsonb)
-- `error_text` (text)
-- `redmine_time_entry_id` (int, nullable)
-- `created_at`
-
-### Таблица `dedupe_locks`
+### `job_runs`
 - `id` (PK)
 - `schedule_id` (FK)
-- `entry_date` (date)
+- `trigger_type` (`cron`/`manual`)
+- `run_at_utc` (datetime)
+- `entry_date_local` (date)
+- `status` (`success`/`error`/`skipped_duplicate`/`skipped_weekend`/`not_due`)
+- `attempt` (int)
+- `request_payload` (json text)
+- `response_payload` (json text)
+- `error_text` (text)
+- `redmine_time_entry_id` (int, nullable)
+
+### `dedupe_locks`
+- `id` (PK)
+- `schedule_id` (FK)
+- `entry_date_local` (date)
 - `dedupe_key` (text)
 - `created_at`
-- `UNIQUE(schedule_id, entry_date, dedupe_key)`
+- `UNIQUE(schedule_id, entry_date_local, dedupe_key)`
 
-> Почему PostgreSQL, а не SQLite: лучше конкуренция, транзакции и блокировки для scheduler/worker + web, надёжнее для многопроцессной работы и масштабирования.
+---
 
-## 5) API эндпойнты
+## 5) API (локальный UI использует эти же эндпойнты)
 
-### Auth
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `GET /api/auth/me`
+### Настройки
+- `GET /api/settings`
+- `PUT /api/settings` — `redmine_base_url`, `api_key`
 
-### Schedules CRUD
+### Расписания
 - `GET /api/schedules`
 - `POST /api/schedules`
 - `GET /api/schedules/{id}`
@@ -166,44 +157,51 @@
 - `POST /api/schedules/{id}/disable`
 - `POST /api/schedules/{id}/run-now`
 
-### Logs / Runs
-- `GET /api/schedules/{id}/runs?limit=50`
-- `GET /api/runs?status=error&from=...&to=...`
+### Логи
+- `GET /api/schedules/{id}/runs`
+- `GET /api/runs?status=error`
 
-### Validation helpers
-- `POST /api/redmine/validate-issue` (issue_id)
-- `GET /api/redmine/activities` (опц.)
+### Валидация
+- `POST /api/redmine/validate-issue`
+
+---
 
 ## 6) Ключевые сценарии
 
-### Сценарий A: создание расписания
-1. UI отправляет форму (`name`, `issue_id`, `hours`, `cron_expr` или days+time, timezone).
-2. Backend округляет `hours` по шагу 0.25.
-3. Backend валидирует issue через Redmine API.
-4. Сохраняет расписание.
+### A. Создание расписания
+1. Пользователь вводит имя, `issue_id`, `hours`, cron (или дни+время).
+2. Бэкенд округляет `hours` по `rounding_step` (обычно 0.25).
+3. Проверяет issue: `GET /issues/{id}.json`.
+4. Сохраняет запись.
 
-### Сценарий B: выполнение по расписанию
-1. APScheduler триггерит job.
-2. Вычисляется локальная дата `Europe/Riga`.
-3. Если `skip_weekends=true` и выходной — `skipped_weekend`.
-4. Проверка дубля.
-5. `POST /time_entries.json`.
-6. Логирование результата в `job_runs`.
+### B. Запуск через crontab
+1. Каждую минуту runner получает список `enabled` расписаний.
+2. Для каждого вычисляет локальное время `Europe/Riga`.
+3. Проверяет, due ли задача в текущую минуту.
+4. Если выходной и `skip_weekends=true` — skip.
+5. Дедуп.
+6. POST `time_entries`.
+7. Запись в `job_runs`.
 
-### Сценарий C: дедупликация
-Гибридный подход:
-- **Локальный ключ**: `hash(issue_id, date, hours, normalized_comments, user_id)` + unique lock.
-- **Удалённая проверка** (если разрешена ролью): query `time_entries` за дату и сравнение ключа.
-- **Fallback**, если чтение time_entries запрещено: только локальный lock + marker в комментарии (`[rt:<schedule_id>:<YYYY-MM-DD>]`).
+### C. Дедупликация
+Рекомендуемый ключ:
+`issue_id|entry_date|hours_rounded|comment_norm|charge_user_id`
 
-### Сценарий D: обработка ошибок
-- Сетевые/5xx: retry 3 раза (экспоненциально: 2s, 5s, 15s).
-- 4xx (валидация/доступ): без retry, сразу error.
-- Все попытки и ответы пишутся в `job_runs`.
+Алгоритм:
+1. Пытаемся вставить локальный lock (`UNIQUE` защищает от дублей).
+2. Если доступно чтение `time_entries` в Redmine — сверяем удалённо.
+3. Если чтение недоступно — работаем только на локальном lock + marker в comment: `[rt:<schedule_id>:<YYYY-MM-DD>]`.
 
-## 7) Минимальный код (скелет)
+### D. Ошибки и retries
+- retry: только для network timeout / 5xx (например 3 попытки: 2s, 5s, 15s)
+- 4xx: без retry
+- все ошибки писать в `job_runs.error_text`
 
-### 7.1 Создание time entry в Redmine (Python)
+---
+
+## 7) Минимальный скелет кода
+
+### 7.1 Клиент Redmine
 
 ```python
 import httpx
@@ -215,22 +213,14 @@ class RedmineClient:
         self.base_url = base_url.rstrip("/")
         self.headers = {"X-Redmine-API-Key": api_key}
 
-    async def get_issue(self, issue_id: int) -> dict:
+    async def validate_issue(self, issue_id: int) -> dict:
         url = f"{self.base_url}/issues/{issue_id}.json"
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url, headers=self.headers)
             r.raise_for_status()
-            return r.json()["issue"]
+            return r.json().get("issue", {})
 
-    async def create_time_entry(
-        self,
-        issue_id: int,
-        hours: float,
-        spent_on: date,
-        comments: str,
-        activity_id: int | None = None,
-        user_id: int | None = None,
-    ) -> dict:
+    async def create_time_entry(self, *, issue_id: int, hours: float, spent_on: date, comments: str, activity_id: int | None = None, user_id: int | None = None) -> dict:
         payload = {
             "time_entry": {
                 "issue_id": issue_id,
@@ -239,9 +229,9 @@ class RedmineClient:
                 "comments": comments,
             }
         }
-        if activity_id:
+        if activity_id is not None:
             payload["time_entry"]["activity_id"] = activity_id
-        if user_id:
+        if user_id is not None:
             payload["time_entry"]["user_id"] = user_id
 
         url = f"{self.base_url}/time_entries.json"
@@ -251,156 +241,114 @@ class RedmineClient:
             return r.json()
 ```
 
-### 7.2 Планировщик APScheduler
+### 7.2 Runner, который вызывается crontab
 
 ```python
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+# python -m app.run_due_jobs
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Riga"))
+TZ = ZoneInfo("Europe/Riga")
 
 
-def register_schedule(schedule):
-    trigger = CronTrigger.from_crontab(
-        schedule.cron_expr,
-        timezone=ZoneInfo(schedule.timezone or "Europe/Riga"),
-    )
-    scheduler.add_job(
-        func=execute_schedule,
-        trigger=trigger,
-        id=f"schedule:{schedule.id}",
-        kwargs={"schedule_id": schedule.id, "trigger_type": "cron"},
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=300,
-    )
+def run_due_jobs(db):
+    now_local = datetime.now(tz=TZ)
+    schedules = db.get_enabled_schedules()
+
+    for s in schedules:
+        if not is_due_now(schedule=s, now_local=now_local):
+            continue
+
+        execute_schedule(schedule=s, now_local=now_local, trigger_type="cron")
 ```
 
-## 8) Пример docker-compose
+### 7.3 crontab
+
+```cron
+* * * * * cd /opt/redmine-repeater && /opt/redmine-repeater/.venv/bin/python -m app.run_due_jobs >> /opt/redmine-repeater/logs/cron.log 2>&1
+```
+
+---
+
+## 8) Локальный запуск (без публикации наружу)
+
+### Вариант без Docker
+1. `python -m venv .venv && source .venv/bin/activate`
+2. `pip install -r requirements.txt`
+3. `uvicorn app.main:app --host 127.0.0.1 --port 8000`
+4. Открыть локально `http://127.0.0.1:8000`
+5. Добавить `crontab -e` строку из примера выше
+
+### Вариант с Docker (только локально)
 
 ```yaml
 version: "3.9"
-
 services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: redmine_repeater
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d redmine_repeater"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
   web:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
-      DATABASE_URL: postgresql+psycopg://app:app@db:5432/redmine_repeater
       APP_TZ: Europe/Riga
-      SECRET_KEY: change_me
+      DB_PATH: /data/app.db
       ENCRYPTION_KEY: change_me_32bytes
     ports:
-      - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
-
-  scheduler:
-    build: .
-    command: python -m app.scheduler
-    environment:
-      DATABASE_URL: postgresql+psycopg://app:app@db:5432/redmine_repeater
-      APP_TZ: Europe/Riga
-      SECRET_KEY: change_me
-      ENCRYPTION_KEY: change_me_32bytes
-    depends_on:
-      db:
-        condition: service_healthy
-
-volumes:
-  pgdata:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/data
 ```
 
-## 9) Таймзона Europe/Riga (важные правила)
+> В этом сценарии cron можно оставить на хосте и вызывать `docker exec <container> python -m app.run_due_jobs`.
 
-- Хранить все timestamps в БД в UTC (`timestamptz`).
-- Локальную дату списания (`spent_on`) вычислять через `ZoneInfo("Europe/Riga")` в момент запуска.
-- Cron интерпретировать в timezone пользователя (`Europe/Riga`), не в UTC.
-- Учитывать DST автоматически через IANA timezone (`Europe/Riga`).
+---
+
+## 9) Таймзона Europe/Riga
+
+Правила:
+- В БД хранить timestamps в UTC.
+- Для `spent_on` всегда брать локальную дату `Europe/Riga` в момент выполнения.
+- Проверку “due now” считать в `Europe/Riga`.
+- DST закрывается автоматически через `zoneinfo`.
 
 Пример:
-- `now_utc -> now_local = now_utc.astimezone(ZoneInfo("Europe/Riga"))`
-- `spent_on = now_local.date()`
 
-## 10) Практика дедупликации
+```python
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-Рекомендуемый порядок:
-1. Сформировать `dedupe_key`:
-   - `issue_id|spent_on|hours_rounded|comment_norm|charge_user_id`
-2. Поставить локальный lock в БД (`INSERT ... ON CONFLICT DO NOTHING`).
-3. Если доступно чтение Redmine time entries — сделать remote check.
-4. Если найден дубль — пометить run как `skipped_duplicate`.
-5. Если нет — отправить `POST /time_entries`.
-6. Добавлять marker в комментарий: `"Daily meeting [rt:12:2025-01-15]"`.
-
-Если у Redmine нет доступа к чтению time entries:
-- полагаться на локальный lock + marker,
-- и на идемпотентность job run (повторные попытки для одного run не создают новую запись).
-
-## 11) Примеры запросов к Redmine
-
-Проверка issue:
-```bash
-curl -H "X-Redmine-API-Key: <API_KEY>" \
-  "<REDMINE_URL>/issues/123.json"
+now_utc = datetime.now(timezone.utc)
+now_riga = now_utc.astimezone(ZoneInfo("Europe/Riga"))
+spent_on = now_riga.date()
 ```
 
-Создание time entry:
-```bash
-curl -X POST -H "Content-Type: application/json" \
-  -H "X-Redmine-API-Key: <API_KEY>" \
-  -d '{
-    "time_entry": {
-      "issue_id": 123,
-      "hours": 0.5,
-      "spent_on": "2026-02-20",
-      "comments": "Daily standup [rt:5:2026-02-20]",
-      "activity_id": 9
-    }
-  }' \
-  "<REDMINE_URL>/time_entries.json"
-```
+---
 
-## 12) План MVP на 1–3 дня
+## 10) Если Redmine не даёт читать time_entries
+
+Fallback-стратегия:
+1. строгий локальный dedupe lock по уникальному ключу;
+2. marker в комментарии (`[rt:schedule_id:date]`);
+3. лог `job_runs` как источник факта списания;
+4. ручная кнопка “Run now” должна проверять lock и не дублировать запись.
+
+---
+
+## 11) Пошаговый MVP план (1–3 дня)
 
 ### День 1
-- Инициализация FastAPI проекта + SQLAlchemy/Alembic.
-- Таблицы: users, redmine_connections, schedules, job_runs, dedupe_locks.
-- Базовый login (single-user), CRUD расписаний.
-- Валидация issue при создании/изменении.
+- FastAPI + SQLite + миграции
+- формы CRUD расписаний
+- сохранение Redmine URL/API key (шифрование)
+- validate issue endpoint
 
 ### День 2
-- APScheduler процесс + загрузка расписаний из БД.
-- Execution service: создание time entry + retry/backoff.
-- Дедуп (локальный lock + marker).
-- Логи запусков и страница истории.
+- `run_due_jobs` + crontab
+- создание time entry + retries
+- dedupe lock + marker
+- таблица логов запусков
 
 ### День 3
-- Ручной запуск “Run now”.
-- Enable/disable, last status в таблице расписаний.
-- Dockerfile + docker-compose.
-- Полировка UI (таблица + форма + фильтр ошибок).
-- Smoke-тесты и чек-лист деплоя.
+- кнопка “выполнить сейчас”
+- enable/disable
+- полировка UI (простая таблица + фильтры ошибок)
+- smoke-тесты локального сценария
 
-## 13) Допущения и расширения
-
-- Шаг округления часов (`0.25`) хранится как настройка расписания.
-- Если нужен multi-user, можно расширить модель прав и связей пользователя с Redmine ключом.
-- Для production: добавить rate limit, audit logs, structured logging и Sentry.
